@@ -28,18 +28,28 @@
 #include "esp_gatt_defs.h"
 #include "esp_log.h"
 #include "nvs_flash.h"
+#include <WebServer.h>
+#include <DNSServer.h>
+#include <Preferences.h>
 
-// =====================  CONFIG  =====================
-// Bi mat (WiFi pass, token, server URL) nam o secrets.h - KHONG commit len git.
-// Clone ve thi copy secrets.h.example -> secrets.h roi dien.
-#include "secrets.h"
-// ====================================================
-
-static const char* TAG = "ANCS";
-#define DEVICE_NAME   "BankBridge"      // ten hien tren iPhone khi pair
+// =====================  CONFIG (khong co secret) =====================
+#define DEVICE_NAME   "BankBridge"          // ten hien tren iPhone khi pair
+#define DEVICE_ID     "esp32-ancs-iphone"   // gui kem moi notif
+#define FORWARD_ALL   1                      // 1=day moi notif ; 0=chi app bank
+#define AP_SSID       "BankBridge-Setup"     // ten hotspot cau hinh lan dau
+#define FACTORY_BTN   0                       // GPIO0 (nut BOOT): giu 3s = factory reset
 #define LOCAL_MTU     500
 #define INVALID_HANDLE 0
 #define GATTS_APP_ID  1
+
+static const char* TAG = "ANCS";
+
+// Cau hinh runtime (luu NVS qua Preferences) - dien qua hotspot lan dau
+static String      g_ssid, g_pass, g_serverUrl, g_token;
+static bool        g_setupMode = false;
+static Preferences prefs;
+static WebServer   webServer(80);
+static DNSServer   dnsServer;
 
 // ---------------- ANCS UUID (little-endian 16 byte) ----------------
 static uint8_t ANCS_SVC_UUID[16]   = {0xD0,0x00,0x2D,0x12,0x1E,0x4B,0x0F,0xA4,0x99,0x4E,0xCE,0xB5,0x31,0xF4,0x05,0x79};
@@ -231,12 +241,12 @@ static void postNotification(const NotifMsg& n) {
   HTTPClient http;
   http.setConnectTimeout(4000);
   http.setTimeout(5000);
-  if (!http.begin(client, SERVER_URL)) {
+  if (!http.begin(client, g_serverUrl)) {
     Serial.println("[POST] http.begin loi");
     return;
   }
   http.addHeader("Content-Type", "application/json; charset=utf-8");
-  http.addHeader("X-Auth-Token", AUTH_TOKEN);
+  http.addHeader("X-Auth-Token", g_token);
   int code = http.POST(body);
   if (code > 0) {
     String resp = http.getString();
@@ -546,27 +556,122 @@ static void initSecurity() {
 }
 
 // ================================================================
+//  PROVISIONING — hotspot cau hinh lan dau + factory reset
+// ================================================================
+static void loadConfig() {
+  prefs.begin("cfg", true);
+  g_ssid      = prefs.getString("ssid", "");
+  g_pass      = prefs.getString("pass", "");
+  g_serverUrl = prefs.getString("server", "");
+  g_token     = prefs.getString("token", "");
+  prefs.end();
+}
+
+static void factoryReset() {
+  Serial.println("\n[FACTORY] Xoa cau hinh -> khoi dong lai...");
+  prefs.begin("cfg", false);
+  prefs.clear();
+  prefs.end();
+  delay(300);
+  ESP.restart();
+}
+
+// Giu nut BOOT (GPIO0) >=3s -> factory reset. Goi trong loop().
+static void checkFactoryButton() {
+  static unsigned long pressStart = 0;
+  if (digitalRead(FACTORY_BTN) == LOW) {
+    if (pressStart == 0) pressStart = millis();
+    else if (millis() - pressStart >= 3000) factoryReset();
+  } else {
+    pressStart = 0;
+  }
+}
+
+static void handleRoot() {
+  String html =
+    "<!DOCTYPE html><html><head><meta charset=utf-8>"
+    "<meta name=viewport content='width=device-width,initial-scale=1'><title>BankBridge Setup</title>"
+    "<style>body{font-family:sans-serif;max-width:420px;margin:auto;padding:16px;background:#f4f4f4}"
+    "h2{color:#0a7}label{font-weight:bold;font-size:14px}input{width:100%;padding:10px;margin:6px 0 12px;"
+    "box-sizing:border-box;border:1px solid #ccc;border-radius:6px}"
+    "button{width:100%;padding:13px;background:#0a7;color:#fff;border:0;font-size:16px;border-radius:6px}"
+    ".n{color:#888;font-size:12px}</style></head><body>"
+    "<h2>&#9881;&#65039; BankBridge &mdash; Cai dat</h2><form method=POST action=/save>"
+    "<label>WiFi</label><input list=nets name=ssid placeholder='Chon hoac go ten WiFi' required>"
+    "<datalist id=nets>";
+  int n = WiFi.scanNetworks();
+  for (int i = 0; i < n; i++) html += "<option value='" + WiFi.SSID(i) + "'>";
+  html +=
+    "</datalist>"
+    "<label>Mat khau WiFi</label><input name=pass type=password placeholder='De trong neu WiFi mo'>"
+    "<label>Server URL</label><input name=server value='http://192.168.1.12:8787/notification'>"
+    "<label>Token (X-Auth-Token)</label><input name=token placeholder='dan token server'>"
+    "<button type=submit>Luu &amp; Khoi dong lai</button></form>"
+    "<p class=n>Giu nut BOOT 3 giay bat cu luc nao de xoa cau hinh (factory reset).</p></body></html>";
+  webServer.send(200, "text/html; charset=utf-8", html);
+}
+
+static void handleSave() {
+  String ssid = webServer.arg("ssid");
+  if (ssid.length() == 0) { webServer.send(400, "text/html; charset=utf-8", "Thieu SSID"); return; }
+  prefs.begin("cfg", false);
+  prefs.putString("ssid",   ssid);
+  prefs.putString("pass",   webServer.arg("pass"));
+  prefs.putString("server", webServer.arg("server"));
+  prefs.putString("token",  webServer.arg("token"));
+  prefs.end();
+  webServer.send(200, "text/html; charset=utf-8",
+    "<!DOCTYPE html><meta charset=utf-8><body style='font-family:sans-serif;text-align:center;padding:48px'>"
+    "<h2>&#9989; Da luu!</h2><p>Thiet bi dang khoi dong lai va ket noi WiFi...</p></body>");
+  delay(1500);
+  ESP.restart();
+}
+
+static void startSetupPortal() {
+  Serial.println("\n[SETUP] Chua co cau hinh -> bat hotspot cai dat.");
+  WiFi.mode(WIFI_AP_STA);          // AP_STA de vua phat hotspot vua scan duoc WiFi
+  WiFi.softAP(AP_SSID);
+  IPAddress ip = WiFi.softAPIP();
+  dnsServer.start(53, "*", ip);    // captive portal: moi domain -> ESP
+  webServer.on("/", handleRoot);
+  webServer.on("/save", HTTP_POST, handleSave);
+  webServer.onNotFound(handleRoot);
+  webServer.begin();
+  Serial.printf("[SETUP] Ket noi WiFi \"%s\" roi mo http://%s\n", AP_SSID, ip.toString().c_str());
+}
+
+// ================================================================
 void setup() {
   Serial.begin(115200);
   unsigned long t0 = millis();
   while (!Serial && (millis() - t0 < 3000)) delay(10);
 
   Serial.println("\n========================================");
-  Serial.println("  ESP32-S3 ANCS Bridge - GIAI DOAN 3");
-  Serial.println("  (ANCS iOS + GATTS Android -> Noti Bridge)");
+  Serial.println("  ESP32-S3 ANCS Bridge - Noti Bridge");
+  Serial.println("  (ANCS iOS + GATTS Android)");
   Serial.println("========================================");
-  Serial.printf("  Server: %s\n", SERVER_URL);
-  Serial.printf("  Forward: %s\n", FORWARD_ALL ? "MOI notif" : "chi app bank");
 
+  pinMode(FACTORY_BTN, INPUT_PULLUP);
   esp_log_level_set(TAG, ESP_LOG_INFO);
 
-  g_notifQ = xQueueCreate(16, sizeof(NotifMsg));
-
-  // NVS (bond keys)
+  // NVS
   esp_err_t ret = nvs_flash_init();
   if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
     nvs_flash_erase(); nvs_flash_init();
   }
+
+  // Doc cau hinh; chua co WiFi -> 1st time setup (hotspot), KHONG init BLE
+  loadConfig();
+  if (g_ssid.length() == 0) {
+    g_setupMode = true;
+    startSetupPortal();
+    return;
+  }
+
+  Serial.printf("  WiFi: %s | Server: %s\n", g_ssid.c_str(), g_serverUrl.c_str());
+  Serial.printf("  Forward: %s\n", FORWARD_ALL ? "MOI notif" : "chi app bank");
+
+  g_notifQ = xQueueCreate(16, sizeof(NotifMsg));
 
   // BT controller -> BLE
   esp_bt_controller_config_t bt_cfg = BT_CONTROLLER_INIT_CONFIG_DEFAULT();
@@ -589,13 +694,24 @@ void setup() {
   // se abort trong coex_core_enable (xung dot khoi tao coexistence WiFi/BLE).
   WiFi.mode(WIFI_STA);
   WiFi.setSleep(true);   // BAT BUOC: modem sleep ON khi WiFi+BLE cung chay (1 radio chia se), neu false -> abort
-  WiFi.begin(WIFI_SSID, WIFI_PASS);
-  Serial.printf("[WiFi] dang ket noi \"%s\" ...\n", WIFI_SSID);
+  WiFi.begin(g_ssid.c_str(), g_pass.c_str());
+  Serial.printf("[WiFi] dang ket noi \"%s\" ...\n", g_ssid.c_str());
 
   Serial.println("[OK] Setup xong. iPhone -> Bluetooth -> \"" DEVICE_NAME "\" -> Pair.");
 }
 
 void loop() {
+  checkFactoryButton();   // giu BOOT 3s = xoa cau hinh
+
+  // ----- Setup mode: chi chay hotspot + web portal -----
+  if (g_setupMode) {
+    dnsServer.processNextRequest();
+    webServer.handleClient();
+    delay(5);
+    return;
+  }
+
+  // ----- Normal mode -----
   static unsigned long lastHb = 0, lastWifiTry = 0;
 
   // Quan ly WiFi: thu reconnect moi 10s neu rot

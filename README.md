@@ -1,11 +1,9 @@
 # ESP32-S3 ANCS Bridge
 
 Cầu nối thông báo: đọc notification trên **iPhone qua ANCS (BLE)** và đẩy lên server
-[Noti Bridge](https://github.com/) qua WiFi (HTTP POST). Mục đích: thay thế SePay để
-nhận biến động số dư ngân hàng.
-
-Có thêm **GATT server (Nordic UART Service)** để app **Android** ghi notification qua BLE
-(Android không có ANCS) → ESP32 trở thành cổng chung cho cả iOS lẫn Android.
+[Noti Bridge](https://github.com/yuHz23/noti-bridge) qua WiFi (HTTP POST) — thay thế SePay
+để nhận biến động số dư ngân hàng. Có **GATT server (Nordic UART Service)** để app **Android**
+(không có ANCS) gửi notification qua BLE → ESP32 trở thành cổng chung cho cả iOS lẫn Android.
 
 ## Phần cứng
 - ESP32-S3-N16R8 (16MB flash, 8MB PSRAM)
@@ -19,19 +17,23 @@ Có thêm **GATT server (Nordic UART Service)** để app **Android** ghi notifi
   vào RX characteristic `6E400002` → ESP32 đẩy vào hàng đợi → POST.
 - WiFi + BLE chạy đồng thời (coexistence): init **BLE trước**, `WiFi.setSleep(true)`.
 
+## Cấu hình lần đầu (không hardcode WiFi/token)
+Boot khi **chưa có cấu hình** → ESP32 phát **hotspot `BankBridge-Setup`** (captive portal):
+1. Điện thoại/laptop kết nối WiFi **`BankBridge-Setup`**.
+2. Mở trình duyệt → **http://192.168.4.1** (thường tự bật).
+3. Chọn WiFi nhà + nhập mật khẩu, **Server URL** (`http://<ip>:8787/notification`), **Token**.
+4. Lưu → ESP32 khởi động lại, kết nối WiFi + BLE → chạy bình thường.
+
+Cấu hình lưu trong NVS (`Preferences`), **không** nằm trong source.
+
+## Factory reset
+Giữ nút **BOOT (GPIO0) ~3 giây** bất cứ lúc nào → xoá cấu hình → quay về chế độ hotspot setup.
+
 ## Build (PlatformIO)
 ```bash
-# 1. Tạo file cấu hình bí mật
-cp src/secrets.h.example src/secrets.h   # rồi điền WiFi / token / server URL
-
-# 2. Build + nạp
-pio run -t upload
+pio run -t upload      # nạp; không cần điền secret trong code
 ```
 
 ## Toolchain
-Arduino-ESP32 core 2.0.17 (Bluedroid). Stack BLE = Bluedroid (API IDF thô `esp_ble_gattc_*`,
-`esp_ble_gatts_*`). Thư viện: ArduinoJson.
-
-## Lưu ý
-- `src/secrets.h` chứa WiFi password + token → **đã .gitignore**, không lên repo.
-- `reference/` là ví dụ ble_ancs chính thức của Espressif (public domain) dùng làm tài liệu.
+Arduino-ESP32 core 2.0.17 (Bluedroid). BLE = Bluedroid (API IDF thô `esp_ble_gattc_*` /
+`esp_ble_gatts_*`). Thư viện: ArduinoJson. `reference/` là ví dụ ble_ancs của Espressif (public domain).
